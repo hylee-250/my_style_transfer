@@ -1,0 +1,59 @@
+prenet:
+  conv_kernel_size: 3
+  dropout: 0.1
+
+transformer:
+  encoder_layer: 4
+  encoder_head: 2
+  encoder_hidden: 256
+  decoder_layer: 4
+  decoder_head: 2
+  decoder_hidden: 256
+  conv_filter_size: 1024
+  conv_kernel_size: [9, 1]
+  encoder_dropout: 0.1
+  decoder_dropout: 0.1
+
+melencoder:
+  encoder_hidden: 128
+  spectral_layer: 2
+  temporal_layer: 2
+  slf_attn_layer: 1
+  slf_attn_head: 2
+  conv_kernel_size: 5
+  encoder_dropout: 0.1
+
+variance_predictor:
+  filter_size: 256
+  kernel_size: 3
+  dropout: 0.5
+
+variance_embedding:
+  kernel_size: 9
+
+discriminator:
+  mel_linear_size: 256
+  phoneme_layer: 3
+  phoneme_hidden: 512
+
+multi_speaker: True
+
+max_seq_len: 1000
+
+flow_postnet:
+  use_txt_cond: True
+  hidden_size: 256
+  post_glow_hidden: 128
+  post_glow_kernel_size: 3
+  post_glow_n_blocks: 8
+  post_glow_n_block_layers: 3
+  share_wn_layers: 4
+  sigmoid_scale: false
+  post_share_cond_layers: false
+  use_txt_cond: true
+  use_latent_cond: true
+  noise_scale: 0.8
+
+vocoder:
+  model: "HiFi-GAN" # support 'HiFi-GAN', 'MelGAN'
+  speaker: "universal" # support  'LJSpeech', 'universal'
