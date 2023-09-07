@@ -15,6 +15,15 @@ from dataset import Dataset
 
 from evaluate import evaluate
 
+import pdb
+import wandb
+
+# start a new wandb run to track this script
+# wandb.init(
+#     # set the wandb project where this run will be logged
+#     project="my_style_transfer"
+# )
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -91,9 +100,23 @@ def main(args, configs):
                 batch = to_device(batch, device)
 
                 # Forward
-                output = (None, None, *model(*(batch[2:-5])))
+                # output = (None, None, *model(*(batch[2:-5])))
+                output = model(*(batch[2:-5]))
 
-                # Cal Loss
+                '''
+                output
+                    mel_out,p_predictions,e_predictions,log_d_predictions,
+                    d_rounded,src_masks,mel_masks,src_lens,mel_lens,
+                    z_pf,ldj_pf, postflow,
+                
+                batch 
+                    ids,raw_texts,speakers,texts,text_lens,
+                    max(text_lens),mels,mel_lens,max(mel_lens),
+                    pitches,energies,durations,raw_quary_texts,quary_texts,quary_text_lens,
+                    max(quary_text_lens),quary_durations,
+                '''
+
+                # Cal Loss            
                 losses_1 = Loss(batch, output)
                 total_loss = losses_1[0]
 
@@ -103,7 +126,7 @@ def main(args, configs):
                 if step % log_step == 0:
                     losses = [l.item() for l in (losses_1+tuple([torch.zeros(1).to(device) for _ in range(3)]))]
                     message1 = "Step {}/{}, ".format(step, total_step)
-                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}".format(
+                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Post flow:{:.4f} ".format(
                         *losses
                     )
 
@@ -127,9 +150,7 @@ def main(args, configs):
                         fig=fig,
                         tag="Training/step_{}_{}".format(step, tag),
                     )
-                    sampling_rate = preprocess_config["preprocessing"]["audio"][
-                        "sampling_rate"
-                    ]
+                    sampling_rate = preprocess_config["preprocessing"]["audio"]["sampling_rate"]
                     log(
                         train_logger,
                         audio=wav_reconstruction,

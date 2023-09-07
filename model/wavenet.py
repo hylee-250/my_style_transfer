@@ -54,7 +54,6 @@ class WN(torch.nn.Module):
             self.res_skip_layers.append(res_skip_layer)
 
     def forward(self, x, x_mask=None, g=None, **kwargs):
-        pdb.set_trace()
         output = torch.zeros_like(x)
         n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
@@ -62,7 +61,8 @@ class WN(torch.nn.Module):
             # cond_layer = torch.nn.Conv1d(gin_channels, 2 * hidden_channels * n_layers, 1)
             # self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name='weight')
             # self.cond_layer: Conv1d(1184,768)
-            # g: [B, 928, 489] 1184-928-256
+            # weight: [768, 1184,1]
+            # g: [B, 928, 493] 1184-928-256
             g = self.cond_layer(g)
 
         for i in range(self.n_layers):

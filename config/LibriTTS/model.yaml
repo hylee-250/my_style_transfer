@@ -43,6 +43,7 @@ max_seq_len: 1000
 flow_postnet:
   use_txt_cond: True
   hidden_size: 256
+  style_dim: 128
   post_glow_hidden: 128
   post_glow_kernel_size: 3
   post_glow_n_blocks: 8

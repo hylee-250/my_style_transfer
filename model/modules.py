@@ -589,21 +589,10 @@ class Conv(nn.Module):
         return x
 
 class Glow(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 hidden_channels,
-                 kernel_size,
-                 dilation_rate,
-                 n_blocks,
-                 n_layers,
-                 p_dropout=0.,
-                 n_split=4,
-                 n_sqz=2,
-                 sigmoid_scale=False,
-                 gin_channels=0,
-                 inv_conv_type='near',
-                 share_cond_layers=False,
-                 share_wn_layers=0,
+    def __init__(self,in_channels,hidden_channels,kernel_size,dilation_rate,
+                 n_blocks,n_layers,p_dropout=0.,n_split=4,n_sqz=2,
+                 sigmoid_scale=False,gin_channels=0,inv_conv_type='near',
+                 share_cond_layers=False,share_wn_layers=0,
                  ):
         super().__init__()
 
@@ -617,6 +606,9 @@ class Glow(nn.Module):
         self.n_split = n_split
         self.n_sqz = n_sqz
         self.sigmoid_scale = sigmoid_scale
+        # gin_channels: 592
+        # 928 / 2 = 464, 592-464=128, 464-336=128
+        # 1184-968=216
         self.gin_channels = gin_channels
         self.share_cond_layers = share_cond_layers
         if gin_channels != 0 and share_cond_layers:
@@ -634,6 +626,19 @@ class Glow(nn.Module):
                 if b % share_wn_layers == 0:
                     wn = WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels * n_sqz,
                             p_dropout, share_cond_layers)
+            '''
+            self.flows.append(
+                CouplingBlock(
+                    in_channels * n_sqz,
+                    hidden_channels,
+                    kernel_size=kernel_size, 
+                    dilation_rate=dilation_rate,
+                    n_layers=n_layers,
+                    gin_channels=gin_channels * n_sqz,
+                    p_dropout=p_dropout,
+                    sigmoid_scale=sigmoid_scale
+                ))
+            '''
             self.flows.append(
                 CouplingBlock(
                     in_channels * n_sqz,
@@ -649,15 +654,17 @@ class Glow(nn.Module):
                 ))
 
     def forward(self, mels, mel_masks=None, g=None, reverse=False, return_hiddens=False):
-        logdet_tot = 0
+        # pdb.set_trace()
         if not reverse:
             # Inference: latent variable z -> Mel
             # self.flows = [ActNorm, InvNear, CouplingBlock] x n_blocks
             flows = self.flows
+            logdet_tot = 0
         else:
             # Training: Mel -> latent variable z
             # reversed(self.flows) = [CouplingBlock, InvNear, ActNorm] x n_blocks
             flows = reversed(self.flows)
+            logdet_tot = None
         if return_hiddens:
             hs = []
         # n_sqz:2
@@ -665,21 +672,35 @@ class Glow(nn.Module):
             # mels: [B,mel_bin,n_feats]
             # mel_masks: [B,1,n_feats]
             mels, mel_masks_ = squeeze(mels, mel_masks, self.n_sqz)
-            # g: torch.concat(x_recon, style_vector)
+            # g: [B,mel_bin+hidden_dim+style_dim,n_feats] = [B,336+128=464,n_feats]
             if g is not None:
                 g, _ = squeeze(g, mel_masks, self.n_sqz)
+                # x_sqz: [B,mel_bin*2,n_feats//2]
+                # g_sqz: [B,464 *2=928,n_feats//2 ]
             mel_masks = mel_masks_
+        
+        # self.share_cond_layers: False
         if self.share_cond_layers and g is not None:
             g = self.cond_layer(g)
+            
         for f in flows:
-            mels, logdet = f(mels, mel_masks, g=g, reverse=reverse)
+            if not reverse:
+                mels, logdet = f(mels, mel_masks, g=g, reverse=reverse)
+                # print('f:',f)
+                logdet_tot += logdet
+                # print('logdet_tot:',logdet_tot)
+            else:
+                mels, logdet = f(mels, mel_masks, g=g, reverse=reverse)
+            
+            # return_hiddens: False
             if return_hiddens:
                 hs.append(mels)
-            logdet_tot += logdet
         if self.n_sqz > 1:
             mels, mel_masks = unsqueeze(mels, mel_masks, self.n_sqz)
+        
         if return_hiddens:
             return mels, logdet_tot, hs
+
         return mels, logdet_tot
 
     def store_inverse(self):
@@ -692,7 +713,126 @@ class Glow(nn.Module):
         self.apply(remove_weight_norm)
         for f in self.flows:
             f.store_inverse()
+     
+
+class CouplingBlock(nn.Module):  # 仿射耦合层
+    def __init__(self, in_channels, hidden_channels, kernel_size, dilation_rate,
+                 n_layers,gin_channels=0, p_dropout=0, sigmoid_scale=False,
+                 share_cond_layers=False, wn=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+        self.p_dropout = p_dropout
+        self.sigmoid_scale = sigmoid_scale
+
+        start = torch.nn.Conv1d(in_channels // 2, hidden_channels, 1)
+        start = torch.nn.utils.weight_norm(start)
+        self.start = start
+        # Initializing last layer to 0 makes the affine coupling layers
+        # do nothing at first.  This helps with training stability
+        end = torch.nn.Conv1d(hidden_channels, in_channels, 1)
+        end.weight.data.zero_()
+        end.bias.data.zero_()
+        self.end = end
+        self.wn = WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels,
+                     p_dropout, share_cond_layers)
+        if wn is not None:
+            self.wn.in_layers = wn.in_layers
+            self.wn.res_skip_layers = wn.res_skip_layers
+
+    def forward(self, x, x_mask=None, reverse=False, g=None, **kwargs):
+        if x_mask is None:
+            x_mask = 1
+        x_0, x_1 = x[:, :self.in_channels // 2], x[:, self.in_channels // 2:]
+        # self.start : torch.nn.Conv1d(in_channels // 2, hidden_channels, 1)
+
+        x = self.start(x_0) * x_mask
+        # self.wn = WN(hidden_channels, kernel_size, dilation_rate, n_layers,
+        #              gin_channels,p_dropout, share_cond_layers)
+        x = self.wn(x, x_mask, g)
+        out = self.end(x)
+
+        z_0 = x_0
+        m = out[:, :self.in_channels // 2, :]
+        logs = out[:, self.in_channels // 2:, :]
+        
+        if self.sigmoid_scale:
+            logs = torch.log(1e-6 + torch.sigmoid(logs + 2))
             
+        if reverse:
+            z_1 = (x_1 - m) * torch.exp(-logs) * x_mask
+            logdet = torch.sum(-logs * x_mask, [1, 2])
+        else:
+            z_1 = (m + torch.exp(logs) * x_1) * x_mask
+            logdet = torch.sum(logs * x_mask, [1, 2])
+            
+        z = torch.cat([z_0, z_1], 1)
+        return z, logdet
+
+    def store_inverse(self):
+        self.wn.remove_weight_norm()
+
+'''
+class CouplingBlock(nn.Module):
+    def __init__(self, in_channels, hidden_channels, kernel_size, dilation_rate,
+                n_layers, gin_channels=0, p_dropout=0, sigmoid_scale=False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+        self.p_dropout = p_dropout
+        self.sigmoid_scale = sigmoid_scale
+
+        start = torch.nn.Conv1d(in_channels//2, hidden_channels, 1)
+        start = torch.nn.utils.weight_norm(start)
+        self.start = start
+        # Initializing last layer to 0 makes the affine coupling layers
+        # do nothing at first.  It helps to stabilze training.
+        end = torch.nn.Conv1d(hidden_channels, in_channels, 1)
+        end.weight.data.zero_()
+        end.bias.data.zero_()
+        self.end = end
+
+        self.wn = WN(hidden_channels, kernel_size, dilation_rate,n_layers,
+                     gin_channels, p_dropout)
+
+    def forward(self, x, x_mask=None, reverse=False, g=None, **kwargs):
+        b, c, t = x.size()
+        if x_mask is None:
+            x_mask = 1
+        x_0, x_1 = x[:,:self.in_channels//2], x[:,self.in_channels//2:]
+
+        x = self.start(x_0) * x_mask
+        x = self.wn(x, x_mask, g)
+        out = self.end(x)
+
+        z_0 = x_0
+        m = out[:, :self.in_channels//2, :]
+        logs = out[:, self.in_channels//2:, :]
+        if self.sigmoid_scale:
+            logs = torch.log(1e-6 + torch.sigmoid(logs + 2))
+
+        if reverse:
+            z_1 = (x_1 - m) * torch.exp(-logs) * x_mask
+            logdet = None
+        else:
+            z_1 = (m + torch.exp(logs) * x_1) * x_mask
+            logdet = torch.sum(logs * x_mask, [1, 2])
+
+        z = torch.cat([z_0, z_1], 1)
+        return z, logdet
+
+    def store_inverse(self):
+        self.wn.remove_weight_norm()
+'''
+
 class ActNorm(nn.Module):  # glow中的线性变换层
     def __init__(self, channels, ddi=False, **kwargs):
         super().__init__()
@@ -737,7 +877,6 @@ class ActNorm(nn.Module):  # glow中的线性变换层
 
             self.bias.data.copy_(bias_init)
             self.logs.data.copy_(logs_init)
-            
 
 class InvConvNear(nn.Module):  # 可逆卷积
     def __init__(self, channels, n_split=4, no_jacobian=False, lu=True, n_sqz=2, **kwargs):
@@ -821,6 +960,56 @@ class InvConvNear(nn.Module):  # 可逆卷积
         weight, _ = self._get_weight()
         self.weight_inv = torch.inverse(weight.float()).to(next(self.parameters()).device)
 
+'''
+class InvConvNear(nn.Module):
+    def __init__(self, channels, n_split=4, no_jacobian=False, **kwargs):
+        super().__init__()
+        assert(n_split % 2 == 0)
+        self.channels = channels
+        self.n_split = n_split
+        self.no_jacobian = no_jacobian
+
+        w_init = torch.linalg.qr(torch.FloatTensor(self.n_split, self.n_split).normal_())[0]
+        if torch.det(w_init) < 0:
+            w_init[:,0] = -1 * w_init[:,0]
+        self.weight = nn.Parameter(w_init)
+
+    def forward(self, x, x_mask=None, reverse=False, **kwargs):
+        b, c, t = x.size()
+        assert(c % self.n_split == 0)
+        if x_mask is None:
+            x_mask = 1
+            x_len = torch.ones((b,), dtype=x.dtype, device=x.device) * t
+        else:
+            x_len = torch.sum(x_mask, [1, 2])
+
+        x = x.view(b, 2, c // self.n_split, self.n_split // 2, t)
+        x = x.permute(0, 1, 3, 2, 4).contiguous().view(b, self.n_split, c // self.n_split, t)
+
+        if reverse:
+            if hasattr(self, "weight_inv"):
+                weight = self.weight_inv
+            else:
+                weight = torch.inverse(self.weight.float()).to(dtype=self.weight.dtype)
+            logdet = None
+        else:
+            weight = self.weight
+            if self.no_jacobian:
+                logdet = 0
+            else:
+                logdet = torch.logdet(self.weight) * (c / self.n_split) * x_len # [b]
+
+        weight = weight.view(self.n_split, self.n_split, 1, 1)
+        z = F.conv2d(x, weight)
+
+        z = z.view(b, 2, self.n_split // 2, c // self.n_split, t)
+        z = z.permute(0, 1, 3, 2, 4).contiguous().view(b, c, t) * x_mask
+        return z, logdet
+
+    def store_inverse(self):
+        self.weight_inv = torch.inverse(self.weight.float()).to(dtype=self.weight.dtype)
+'''
+
 class InvConv(nn.Module):
     def __init__(self, channels, no_jacobian=False, lu=True, **kwargs):
         super().__init__()
@@ -896,67 +1085,7 @@ class InvConv(nn.Module):
     def store_inverse(self):
         self.weight, self.dlogdet = self.get_weight('cuda', reverse=True)        
 
-class CouplingBlock(nn.Module):  # 仿射耦合层
-    def __init__(self, in_channels, hidden_channels, kernel_size, dilation_rate, n_layers,
-                 gin_channels=0, p_dropout=0, sigmoid_scale=False,
-                 share_cond_layers=False, wn=None):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.kernel_size = kernel_size
-        self.dilation_rate = dilation_rate
-        self.n_layers = n_layers
-        self.gin_channels = gin_channels
-        self.p_dropout = p_dropout
-        self.sigmoid_scale = sigmoid_scale
-
-        start = torch.nn.Conv1d(in_channels // 2, hidden_channels, 1)
-        start = torch.nn.utils.weight_norm(start)
-        self.start = start
-        # Initializing last layer to 0 makes the affine coupling layers
-        # do nothing at first.  This helps with training stability
-        end = torch.nn.Conv1d(hidden_channels, in_channels, 1)
-        end.weight.data.zero_()
-        end.bias.data.zero_()
-        self.end = end
-        self.wn = WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels,
-                     p_dropout, share_cond_layers)
-        if wn is not None:
-            self.wn.in_layers = wn.in_layers
-            self.wn.res_skip_layers = wn.res_skip_layers
-
-    def forward(self, x, x_mask=None, reverse=False, g=None, **kwargs):
-        if x_mask is None:
-            x_mask = 1
-        x_0, x_1 = x[:, :self.in_channels // 2], x[:, self.in_channels // 2:]
-        # self.start : torch.nn.Conv1d(in_channels // 2, hidden_channels, 1)
-
-        x = self.start(x_0) * x_mask
-        # self.wn = WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels,
-        #              p_dropout, share_cond_layers)
-        x = self.wn(x, x_mask, g)
-        out = self.end(x)
-
-        z_0 = x_0
-        m = out[:, :self.in_channels // 2, :]
-        logs = out[:, self.in_channels // 2:, :]
-        if self.sigmoid_scale:
-            logs = torch.log(1e-6 + torch.sigmoid(logs + 2))
-        if reverse:
-            z_1 = (x_1 - m) * torch.exp(-logs) * x_mask
-            logdet = torch.sum(-logs * x_mask, [1, 2])
-        else:
-            z_1 = (m + torch.exp(logs) * x_1) * x_mask
-            logdet = torch.sum(logs * x_mask, [1, 2])
-        z = torch.cat([z_0, z_1], 1)
-        return z, logdet
-
-    def store_inverse(self):
-        self.wn.remove_weight_norm()
-
-
 def squeeze(mels, mel_masks=None, n_sqz=2):
-    # pdb.set_trace()
     # mels: [B,mel_bin,n_feats]
     # mel_masks: [B,1,n_feats]
     b, c, t = mels.size()
@@ -978,6 +1107,8 @@ def squeeze(mels, mel_masks=None, n_sqz=2):
 
 
 def unsqueeze(mels, mel_masks=None, n_sqz=2):
+    # mels: [B,mel_bin*2=160,n_feats]
+    # mel_masks: [B,1,n_feats]
     b, c, t = mels.size()
 
     x_unsqz = mels.view(b, n_sqz, c // n_sqz, t)
@@ -986,5 +1117,5 @@ def unsqueeze(mels, mel_masks=None, n_sqz=2):
     if mel_masks is not None:
         mel_masks = mel_masks.unsqueeze(-1).repeat(1, 1, 1, n_sqz).view(b, 1, t * n_sqz)
     else:
-        x_mask = torch.ones(b, 1, t * n_sqz).to(device=mels.device, dtype=mels.dtype)
-    return x_unsqz * x_mask, x_mask
+        mel_masks = torch.ones(b, 1, t * n_sqz).to(device=mels.device, dtype=mels.dtype)
+    return x_unsqz * mel_masks, mel_masks

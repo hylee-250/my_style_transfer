@@ -44,13 +44,15 @@ class StyleSpeech(nn.Module):
         
         # build post flow
         self.noise_sclale = model_config['flow_postnet']['noise_scale']
+        # mel_bin: 80
         cond_hs = 80
         if model_config['flow_postnet']['use_txt_cond'] == True:
             # cond_hs = 80 + 256 = 336
             cond_hs = cond_hs + model_config['flow_postnet']['hidden_size']
 
-        # cond_hs = 336 + 256 = 692
-        cond_hs = cond_hs + model_config['flow_postnet']['hidden_size']
+        # cond_hs = 336 + 128 = 464
+        # 672 / 2 = 336
+        cond_hs = cond_hs + model_config['flow_postnet']['style_dim']
         self.post_flow = Glow(
             80, model_config['flow_postnet']['post_glow_hidden'], model_config['flow_postnet']['post_glow_kernel_size'], 1,
             model_config['flow_postnet']['post_glow_n_blocks'], model_config['flow_postnet']['post_glow_n_block_layers'],
@@ -60,7 +62,7 @@ class StyleSpeech(nn.Module):
             share_wn_layers=model_config['flow_postnet']['share_wn_layers'],
             sigmoid_scale=model_config['flow_postnet']['sigmoid_scale']
         )
-        self.prior_dist = dist.Normal(0, 1)
+        self.prior_dist = dist.Normal(0, 1,validate_args=False)
         
 
     def G(self,style_vector,texts,src_masks,mel_masks,max_mel_len,
@@ -105,7 +107,7 @@ class StyleSpeech(nn.Module):
         # ret['ref_prosody'] = prosody_utter_mel + prosody_ph_mel + prosody_word_mel
         # spk_embed, emo_embed, local style encoder가 쓰이지 않기에 return 하지 않음
         
-        self.run_post_glow(ref_mels, infer)
+        # self.run_post_glow(ref_mels, infer)
         #self.run_post_glow(ref_mels, infer, is_training, ret)
         # return ret
         ########################################################################
@@ -133,6 +135,7 @@ class StyleSpeech(nn.Module):
             # mel_masks = mel_masks.transpose(1,2)
             
             z_pf,ldj_pf, postflow = self.run_post_glow(mels,infer,mel_out,decoder_inp,style_vector,mel_masks)
+            
             return (
                 mel_out,p_predictions,e_predictions,log_d_predictions,
                 d_rounded,src_masks,mel_masks,src_lens,mel_lens,
@@ -160,14 +163,15 @@ class StyleSpeech(nn.Module):
         B, _, n_feats = g.shape
         if self.model_config['flow_postnet']['use_txt_cond'] == True:
             # decoder_inp: [B,n_feats,hidden_dim]
+            # decoder_inp.transpose(1,2): [B,hidden_dim,n_feats]
             g = torch.cat([g, decoder_inp.transpose(1, 2)], 1)
-            # g: [B,mel_bin+hidden_dim,n_feats]
+            # g: [B,mel_bin+hidden_dim,n_feats] = [B,80+256=336,n_feats]
         
         g_style_vector = style_vector.repeat(1,n_feats,1).transpose(1,2)
         # g_style_vector: [B,style_dim,n_feats]
         
         g = torch.cat([g, g_style_vector], dim=1)
-        # g = g + g_style_vector : [B,mel_bin+hidden_dim+style_dim,n_feats]
+        # g = g + g_style_vector : [B,mel_bin+hidden_dim+style_dim,n_feats] = [B,336+128=464,n_feats]
         
         prior_dist = self.prior_dist
         if not infer:
@@ -177,7 +181,11 @@ class StyleSpeech(nn.Module):
             mels = mels.transpose(1, 2)
             # mel_masks: [B,1,n_feats]
             # mels: [B,mel_bin,n_feats]
+            
+            # self.post_flow: Glow()
+            # z_postflow: mels, ldj: log determinant total
             z_postflow, ldj = self.post_flow(mels, mel_masks, g=g)
+            # z_postflow: [B,mel_bin,n_feats], ldj: [B]
             ldj = ldj / y_lengths / 80
             z_pf, ldj_pf = z_postflow, ldj
             postflow = -prior_dist.log_prob(z_postflow).mean() - ldj.mean()
